@@ -923,6 +923,79 @@
         return (compFiber && (compFiber.stateNode || compFiber)) || null;
     }
 
+    function getReactFiberFromDom(el) {
+        if (!el || typeof el !== "object") return null;
+        const key = Object.keys(el).find(
+            (k) =>
+                k.startsWith("__reactFiber$") ||
+                k.startsWith("__reactInternalInstance$"),
+        );
+        return key ? el[key] : null;
+    }
+
+    /**
+     * 深度遍历 React Fiber，读取 Ant Design Table 的选中项（含 rowSelection）。
+     * 虚拟列表下 DOM 只能看到视口内勾选行，React 侧往往仍有完整 selectedRowKeys。
+     */
+    function scanFiberForAntdTableSelection(rootFiber, maxNodes) {
+        const limit = maxNodes == null ? 12000 : maxNodes;
+        if (!rootFiber) return null;
+        const q = [rootFiber];
+        let nodes = 0;
+        /** @type {{ keys: string[]; unselectedKeys: string[] } | null} */
+        let best = null;
+        while (q.length && nodes < limit) {
+            const cur = q.shift();
+            nodes++;
+            if (!cur) continue;
+            const mp = cur.memoizedProps || cur.pendingProps;
+            if (mp && typeof mp === "object") {
+                let keys = null;
+                let unselected = null;
+                if (Array.isArray(mp.selectedRowKeys)) {
+                    keys = mp.selectedRowKeys;
+                    unselected = mp.unselectedRowKeys;
+                }
+                const rs = mp.rowSelection;
+                if ((!keys || !keys.length) && rs && typeof rs === "object") {
+                    if (Array.isArray(rs.selectedRowKeys)) {
+                        keys = rs.selectedRowKeys;
+                        unselected = rs.unselectedRowKeys;
+                    }
+                }
+                if (Array.isArray(keys) && keys.length) {
+                    const ks = keys
+                        .map((k) => String(k == null ? "" : k).trim())
+                        .filter(Boolean);
+                    if (ks.length) {
+                        const us = Array.isArray(unselected)
+                            ? unselected
+                                  .map((k) => String(k == null ? "" : k).trim())
+                                  .filter(Boolean)
+                            : [];
+                        if (!best || ks.length > best.keys.length) {
+                            best = { keys: ks, unselectedKeys: us };
+                        }
+                    }
+                }
+            }
+            let ch = cur.child;
+            while (ch) {
+                q.push(ch);
+                ch = ch.sibling;
+            }
+        }
+        return best;
+    }
+
+    function pan123ParseUiSelectionCount() {
+        const t = String(document.body?.innerText || "");
+        const m = t.match(/已选择\s*(\d+)\s*项/);
+        if (!m) return null;
+        const n = Number(m[1]);
+        return Number.isFinite(n) ? n : null;
+    }
+
     /** 勾选状态追踪 */
     class TableRowSelector123 {
         selectedRowKeys = [""];
@@ -1232,11 +1305,86 @@
             return [...keys];
         }
 
+        _scanBestReactTableSelection() {
+            const roots = document.querySelectorAll(
+                ".ant-table-wrapper, .ant-table, [class*='ant-table']",
+            );
+            /** @type {{ keys: string[]; unselectedKeys: string[] } | null} */
+            let best = null;
+            for (let i = 0; i < roots.length; i++) {
+                const fiber = getReactFiberFromDom(roots[i]);
+                if (!fiber) continue;
+                const hit = scanFiberForAntdTableSelection(fiber, 12000);
+                if (hit && (!best || hit.keys.length > best.keys.length)) {
+                    best = hit;
+                }
+            }
+            const appRoot =
+                document.getElementById("root") ||
+                document.getElementById("app") ||
+                document.body;
+            const rf = getReactFiberFromDom(appRoot);
+            if (rf) {
+                const hit = scanFiberForAntdTableSelection(rf, 16000);
+                if (hit && (!best || hit.keys.length > best.keys.length)) {
+                    best = hit;
+                }
+            }
+            return best;
+        }
+
         getSelection() {
             this._syncFromDomFallback();
-            if (!this.isSelectAll && this.selectedRowKeys.length === 0) {
+            const domIsAll = this.isSelectAll;
+            const domKeys = [...this.selectedRowKeys];
+            const domUnselected = [...this.unselectedRowKeys];
+
+            const reactSel = this._scanBestReactTableSelection();
+
+            if (domIsAll) {
+                if (
+                    reactSel &&
+                    reactSel.unselectedKeys &&
+                    reactSel.unselectedKeys.length > domUnselected.length
+                ) {
+                    this.unselectedRowKeys = [...reactSel.unselectedKeys];
+                }
+                return {
+                    isSelectAll: true,
+                    selectedRowKeys: [],
+                    unselectedRowKeys: [...this.unselectedRowKeys],
+                };
+            }
+
+            if (reactSel && reactSel.keys.length) {
+                const merged = Array.from(
+                    new Set(
+                        [...reactSel.keys, ...domKeys].map((k) => String(k).trim()),
+                    ),
+                ).filter(Boolean);
+                this.selectedRowKeys = merged;
+                this.unselectedRowKeys = [];
+                this.isSelectAll = false;
+            } else if (!this.isSelectAll && this.selectedRowKeys.length === 0) {
                 this._syncFromReactFallback();
             }
+
+            const uiN = pan123ParseUiSelectionCount();
+            if (
+                uiN != null &&
+                !this.isSelectAll &&
+                this.selectedRowKeys.length > 0 &&
+                this.selectedRowKeys.length < uiN
+            ) {
+                try {
+                    console.warn(
+                        `[秒传工具][123] 页面显示已选择 ${uiN} 项，但只解析到 ${this.selectedRowKeys.length} 个文件 ID。可尝试滚动列表让选中行进入视口后重试，或刷新页面。`,
+                    );
+                } catch {
+                    /* ignore */
+                }
+            }
+
             return {
                 isSelectAll: this.isSelectAll,
                 selectedRowKeys: [...this.selectedRowKeys],
@@ -1353,15 +1501,7 @@
 
         async getFileInfoBatch(idList) {
             const batchSize = 100;
-            const rows = [
-                {
-                    fileName: "",
-                    etag: "",
-                    size: 0,
-                    type: 0,
-                    fileId: 0,
-                },
-            ];
+            const rows = [];
             for (let i = 0; i < idList.length; i += batchSize) {
                 const batch = idList.slice(i, i + batchSize);
                 const fileIdList = batch.map((fileId) => ({ fileId }));
@@ -1423,10 +1563,9 @@
 
         async collectFiles() {
             const sel = pan123Selector.getSelection();
-            const selectedRowKeyHints =
-                !sel.isSelectAll && sel.selectedRowKeys.length === 0
-                    ? pan123Selector.getSelectedRowKeyHints()
-                    : [];
+            const selectedRowKeyHints = sel.isSelectAll
+                ? []
+                : pan123Selector.getSelectedRowKeyHints();
             const selectedNameHints =
                 !sel.isSelectAll && sel.selectedRowKeys.length === 0
                     ? pan123Selector.getSelectedNameHints()
@@ -1465,10 +1604,13 @@
                             !sel.unselectedRowKeys.includes(f.fileId.toString()),
                     );
             } else {
-                const selectedKeys =
-                    sel.selectedRowKeys.length > 0
-                        ? sel.selectedRowKeys
-                        : selectedRowKeyHints;
+                const selectedKeys = Array.from(
+                    new Set(
+                        [...sel.selectedRowKeys, ...selectedRowKeyHints].map((k) =>
+                            String(k == null ? "" : k).trim(),
+                        ),
+                    ),
+                ).filter(Boolean);
                 if (selectedKeys.length > 0) {
                     const allFileInfo = await pan123Api.getFileInfoBatch(
                         selectedKeys,
