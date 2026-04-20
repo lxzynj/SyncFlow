@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         云盘秒传工具（百度/夸克/天翼/123/光鸭）
-// @version      2026.04.16
-// @description  云盘秒传工具（百度/夸克/天翼/123/光鸭）
+// @name         云盘秒传工具（百度/夸克/天翼/123/光鸭）fix
+// @version      2026.04.20
+// @description  云盘秒传工具（百度/夸克/天翼/123/光鸭）修复天翼分享页卡死，百度不能导出
 // @run-at       document-idle
 // @match        https://pan.quark.cn/*
 // @match        https://drive.quark.cn/*
@@ -2645,49 +2645,210 @@
             if (!s || s.length !== 32) return s.toLowerCase();
             // 已是标准32位十六进制MD5，无需解密
             if (/^[0-9a-f]{32}$/i.test(s)) return s.toLowerCase();
+
+            // 检查是否为有效的百度加密MD5格式
             // 加密后第9位（索引9）是 'g'~'v' 范围字符，代表 0~15 的偏移量
             const specialChar = s.charAt(9);
-            const offset = specialChar.charCodeAt(0) - "g".charCodeAt(0);
-            if (offset < 0 || offset > 15) return s.toLowerCase();
+            const charCode = specialChar.charCodeAt(0);
+            const offset = charCode - "g".charCodeAt(0);
+
+            // 如果不是有效的加密格式，直接返回原始值的小写形式
+            if (offset < 0 || offset > 15) {
+                // 可能是其他格式的MD5，直接返回
+                if (/^[0-9a-zA-Z]{32}$/.test(s)) return s.toLowerCase();
+                return "";
+            }
+
             // 恢复 r[9]：将特殊字符替换回对应十六进制字符
             const r = s.toLowerCase().split("");
             r[9] = offset.toString(16);
+
             // 逆向XOR（XOR自逆）：i[o] = parseInt(r[o], 16) ^ (15 & o)
             const dec = [];
             for (let o = 0; o < 32; o++) {
-                const v = parseInt(r[o], 16);
+                const char = r[o];
+                // 跳过非十六进制字符
+                if (!/^[0-9a-f]$/.test(char)) {
+                    return s.toLowerCase();
+                }
+                const v = parseInt(char, 16);
                 if (isNaN(v)) return s.toLowerCase();
                 dec[o] = (v ^ (15 & o)).toString(16);
             }
+
             // 逆向重组（与加密时相同，因为 swap 自逆）
             const original =
                 dec.slice(8, 16).join("") +
                 dec.slice(0, 8).join("") +
                 dec.slice(24, 32).join("") +
                 dec.slice(16, 24).join("");
+
+            // 验证解密结果是有效的MD5
             if (/^[0-9a-f]{32}$/.test(original)) return original;
+
+            // 解密失败，返回原始值
             return s.toLowerCase();
         },
 
         /** 从页面全局变量或 script 标签提取 bdstoken */
         getBdstoken() {
+            // 如果之前获取的 token 存在但已过期，可以通过刷新页面重新获取
+            // 这里添加多种获取方式，优先级从高到低
+
+            // 方式0: 从当前页面 URL 获取 (有时百度会在 URL 中附带 token)
+            try {
+                const urlParams = new URLSearchParams(window.location.search);
+                const urlToken = urlParams.get('bdstoken') || urlParams.get('token');
+                if (urlToken && urlToken.length > 10) return urlToken;
+            } catch { /* ignore */ }
+
+            // 方式1: 从 yunData 获取 (传统方式)
             try {
                 if (typeof unsafeWindow !== "undefined") {
                     const yw = unsafeWindow.yunData;
                     if (yw && yw.MYBDSTOKEN) return String(yw.MYBDSTOKEN);
+
+                    // 方式2: 从其他全局变量获取
+                    if (unsafeWindow.locals && unsafeWindow.locals.bdstoken) {
+                        return String(unsafeWindow.locals.bdstoken);
+                    }
+                    if (unsafeWindow.context && unsafeWindow.context.bdstoken) {
+                        return String(unsafeWindow.context.bdstoken);
+                    }
+                    if (unsafeWindow.config && unsafeWindow.config.bdstoken) {
+                        return String(unsafeWindow.config.bdstoken);
+                    }
+
+                    // 方式3: 从 yunData 内部属性遍历查找
+                    if (yw) {
+                        for (const key of Object.keys(yw)) {
+                            if (/bdstoken/i.test(key) && typeof yw[key] === 'string' && yw[key].length > 10) {
+                                return String(yw[key]);
+                            }
+                        }
+                        // 尝试遍历所有字符串属性
+                        for (const key of Object.keys(yw)) {
+                            if (typeof yw[key] === 'string' && yw[key].length > 20 && yw[key].length < 100) {
+                                // 可能是 token 的格式
+                                if (/^[a-f0-9]{20,64}$/i.test(yw[key])) {
+                                    return String(yw[key]);
+                                }
+                            }
+                        }
+                    }
+
+                    // 方式4: 从 Redux store 获取 (百度新版本)
+                    const stores = [
+                        unsafeWindow.__redux_store__,
+                        unsafeWindow.store,
+                        unsafeWindow.reduxStore,
+                        unsafeWindow.__NEXT_REdux_STORE__,
+                    ];
+                    for (const store of stores) {
+                        if (!store || typeof store.getState !== 'function') continue;
+                        try {
+                            const state = store.getState();
+                            if (!state) continue;
+
+                            // 递归查找 state 中可能包含 bdstoken 的字段
+                            const findToken = (obj, depth = 0) => {
+                                if (depth > 5 || !obj || typeof obj !== 'object') return null;
+                                for (const key of Object.keys(obj)) {
+                                    if (/bdstoken/i.test(key) && typeof obj[key] === 'string') {
+                                        return obj[key];
+                                    }
+                                    if (key === 'token' || key === 'access_token' || key === 'authToken') {
+                                        const val = obj[key];
+                                        if (typeof val === 'string' && val.length > 20) {
+                                            return val;
+                                        }
+                                    }
+                                    const found = findToken(obj[key], depth + 1);
+                                    if (found) return found;
+                                }
+                                return null;
+                            };
+
+                            const token = findToken(state);
+                            if (token) return String(token);
+                        } catch { /* ignore */ }
+                    }
+
+                    // 方式5: 从其他全局对象获取
+                    const otherObjs = [
+                        unsafeWindow.pageData,
+                        unsafeWindow.__INITIAL_STATE__,
+                        unsafeWindow.__NUXT__,
+                        unsafeWindow.serverData,
+                        unsafeWindow.bootstrapData,
+                    ];
+                    for (const obj of otherObjs) {
+                        if (!obj || typeof obj !== 'object') continue;
+                        for (const key of Object.keys(obj)) {
+                            if (/bdstoken|token/i.test(key) && typeof obj[key] === 'string' && obj[key].length > 10) {
+                                return String(obj[key]);
+                            }
+                        }
+                    }
                 }
             } catch { /* ignore */ }
+
+            // 方式6: 从 script 标签提取 (扩展正则匹配)
             const scripts = document.querySelectorAll("script");
             for (const s of scripts) {
-                const m = (s.textContent || "").match(/"bdstoken"\s*[=:]\s*"([a-f0-9]{32})"/i);
-                if (m) return m[1];
+                const text = s.textContent || "";
+                // 匹配各种 bdstoken 格式
+                const patterns = [
+                    /"bdstoken"\s*[=:]\s*"([^"]{20,64})"/i,
+                    /bdstoken["\s]*[=:]["\s]*([a-f0-9]{20,64})/i,
+                    /BDSTOKEN["\s]*[=:]["\s]*([a-f0-9]{20,64})/i,
+                    /"token"\s*[=:]\s*"([a-f0-9]{20,64})"/i,
+                    /token["\s]*[=:]["\s]*([a-f0-9]{20,64})/i,
+                    /"auth_token"\s*[=:]\s*"([^"]{20,64})"/i,
+                ];
+                for (const pattern of patterns) {
+                    const m = text.match(pattern);
+                    if (m && m[1]) return m[1];
+                }
             }
+
+            // 方式7: 从 localStorage/sessionStorage 获取
+            try {
+                for (const key of Object.keys(localStorage)) {
+                    if (/bdstoken|token|auth/i.test(key)) {
+                        const val = localStorage.getItem(key);
+                        if (val && typeof val === 'string' && val.length > 10) {
+                            try {
+                                const obj = JSON.parse(val);
+                                const t = obj?.bdstoken || obj?.token || obj?.access_token;
+                                if (t && typeof t === 'string') return String(t);
+                            } catch { /* not JSON */ }
+                            if (/^[a-f0-9]{20,64}$/i.test(val)) return val;
+                        }
+                    }
+                }
+            } catch { /* ignore */ }
+
             return "";
         },
 
         /** 从 React fiber / DOM / 全局变量获取选中文件/文件夹的 fs_id 列表 */
         getSelectedFsIds() {
             const ids = new Set();
+
+            // 方法0：从 DOM data 属性直接获取（新增，最可靠）
+            try {
+                const selectedItems = document.querySelectorAll('[data-id], [data-fs-id], [data-fsid]');
+                for (const el of selectedItems) {
+                    const id = el.getAttribute('data-id') ||
+                              el.getAttribute('data-fs-id') ||
+                              el.getAttribute('data-fsid');
+                    if (id && /^\d+$/.test(id)) {
+                        ids.add(id);
+                    }
+                }
+                if (ids.size) return [...ids];
+            } catch { /* ignore */ }
 
             // 方法1：扫描 React fiber 树，查找含 selectedList/checkedList 的组件 state/props
             const scanFiber = (root, maxNodes) => {
@@ -2814,11 +2975,58 @@
 
         /** 从 URL hash/search 获取当前目录路径 */
         getCurrentDir() {
+            // 方法1: 从 URL 参数获取
             const src = location.hash + location.search;
             const m = src.match(/[?&]path=([^&]+)/);
             if (m) {
                 try { return decodeURIComponent(m[1]); } catch { return m[1]; }
             }
+
+            // 方法2: 从面包屑获取 (最可靠)
+            try {
+                const breadcrumb = document.querySelector('.breadcrumb, .nav-breadcrumb, [class*="breadcrumb"], .current-folder, [class*="currentFolder"]');
+                if (breadcrumb) {
+                    const items = breadcrumb.querySelectorAll('a, span, [class*="item"]');
+                    const paths = [];
+                    for (let i = 0; i < items.length; i++) {
+                        const text = items[i].textContent?.trim();
+                        // 过滤掉非路径文本
+                        if (text && text !== '全部文件' && text !== '首页' && !text.includes('最近') && !text.includes('?')) {
+                            if (/^[\/a-zA-Z0-9\u4e00-\u9fa5\u3000-\u303f\uff00-\uffef\u3400-\u4dbf\u20000-\u2a6df\u2a700-\u2b73f\u2b740-\u2b81f\u2b820-\u2ceaf\u2ceb0-\u2ebef\u30000-\u3134f]$/.test(text)) {
+                                paths.push(text);
+                            }
+                        }
+                    }
+                    if (paths.length > 0) {
+                        return '/' + paths.map(p => encodeURIComponent(p)).join('/');
+                    }
+                }
+            } catch { /* ignore */ }
+
+            // 方法3: 从全局变量获取
+            try {
+                if (typeof unsafeWindow !== "undefined") {
+                    const yw = unsafeWindow.yunData;
+                    if (yw && yw.path) return String(yw.path).split('?')[0];  // 去掉查询参数
+                    if (yw && yw.currentDir) return String(yw.currentDir).split('?')[0];
+                    if (yw && yw.curPath) return String(yw.curPath).split('?')[0];
+                    if (yw && yw.request && yw.request.params && yw.request.params.path) {
+                        return String(yw.request.params.path).split('?')[0];
+                    }
+                }
+            } catch { /* ignore */ }
+
+            // 方法4: 从 DOM 当前目录元素获取
+            try {
+                const curDirEl = document.querySelector('[class*="curDir"], [class*="current-dir"], [class*="currentPath"], .folder-path');
+                if (curDirEl) {
+                    const text = curDirEl.textContent?.trim();
+                    if (text && !text.includes('?')) {
+                        return text.startsWith('/') ? text : '/' + text;
+                    }
+                }
+            } catch { /* ignore */ }
+
             return "/";
         },
 
@@ -2853,30 +3061,48 @@
             const files = [];
             let page = 1;
             const bdstoken = this.getBdstoken();
+
+            if (!bdstoken) {
+                console.warn('[秒传工具] listDir: bdstoken is empty');
+                return files;
+            }
+
             while (true) {
                 const url = "https://pan.baidu.com/api/list?" +
                     `dir=${encodeURIComponent(dir)}&order=name&desc=0&showempty=0` +
                     `&web=1&page=${page}&num=100&channel=chunlei&app_id=250528` +
                     `&bdstoken=${encodeURIComponent(bdstoken)}`;
-                const text = await helper.get(url, { Referer: "https://pan.baidu.com/disk/main" });
-                const data = JSON.parse(text);
-                if (data.errno !== 0 || !Array.isArray(data.list)) break;
-                for (const item of data.list) {
-                    const itemPath = pathPrefix ? `${pathPrefix}/${item.server_filename}` : item.server_filename;
-                    if (item.isdir === 1) {
-                        files.push(...(await this.listDir(item.path, itemPath)));
-                    } else {
-                    files.push({
-                        fs_id: String(item.fs_id),
-                        path: itemPath,
-                        size: Number(item.size || 0),
-                        md5: this.decodeBaiduMd5(item.md5),
-                    });
+                try {
+                    const text = await helper.get(url, { Referer: "https://pan.baidu.com/disk/main" });
+                    const data = JSON.parse(text);
+
+                    // errno=-7 通常是 bdstoken 无效或过期
+                    if (data.errno === -7) {
+                        console.warn('[秒传工具] listDir: bdstoken expired or invalid');
+                        break;
                     }
+
+                    if (data.errno !== 0 || !Array.isArray(data.list)) break;
+                    for (const item of data.list) {
+                        const itemPath = pathPrefix ? `${pathPrefix}/${item.server_filename}` : item.server_filename;
+                        if (item.isdir === 1) {
+                            files.push(...(await this.listDir(item.path, itemPath)));
+                        } else {
+                        files.push({
+                            fs_id: String(item.fs_id),
+                            path: itemPath,
+                            size: Number(item.size || 0),
+                            md5: this.decodeBaiduMd5(item.md5),
+                        });
+                        }
+                    }
+                    if (data.list.length < 100) break;
+                    page++;
+                    await helper.sleep(400);
+                } catch (e) {
+                    console.error('[秒传工具] listDir error:', e);
+                    break;
                 }
-                if (data.list.length < 100) break;
-                page++;
-                await helper.sleep(400);
             }
             return files;
         },
@@ -2885,6 +3111,12 @@
         async getFileMetas(fsIds) {
             const result = {};
             const bdstoken = this.getBdstoken();
+
+            if (!bdstoken) {
+                console.warn('[秒传工具] getFileMetas: bdstoken is empty');
+                return result;
+            }
+
             const batchSize = 100;
             for (let i = 0; i < fsIds.length; i += batchSize) {
                 const batch = fsIds.slice(i, i + batchSize);
@@ -2896,6 +3128,13 @@
                 try {
                     const text = await helper.get(url, { Referer: "https://pan.baidu.com/disk/main" });
                     const data = JSON.parse(text);
+
+                    // errno=-7 通常是 bdstoken 无效或过期
+                    if (data.errno === -7) {
+                        console.warn('[秒传工具] getFileMetas: bdstoken expired or invalid');
+                        break;
+                    }
+
                     if (data.errno === 0 && Array.isArray(data.info)) {
                         for (const item of data.info) {
                         result[String(item.fs_id)] = {
@@ -2907,7 +3146,9 @@
                             };
                         }
                     }
-                } catch { /* ignore */ }
+                } catch (e) {
+                    console.error('[秒传工具] getFileMetas error:', e);
+                }
                 await helper.sleep(300);
             }
             return result;
@@ -2937,15 +3178,43 @@
             if (!output.length && !folderItems.length) {
                 const selectedNames = this.getSelectedFileNames();
                 if (!selectedNames.length) throw new Error("请先在百度网盘勾选要导出的文件或文件夹");
+
                 const currentDir = this.getCurrentDir();
                 helper.updateLoadingMsg("正在获取文件列表...");
                 const bdstoken = this.getBdstoken();
+
+                if (!bdstoken) {
+                    throw new Error("无法获取百度网盘 bdstoken。\n\n可能原因：\n1. 页面已过期，请刷新百度网盘页面\n2. 未登录或登录已过期\n3. 百度网盘版本已更新，需要更新脚本\n\n请尝试：刷新页面后重新登录百度网盘，然后再次点击生成秒传JSON");
+                }
+
+                // 确保路径不包含查询参数（百度 API 不接受带 ? 的路径）
+                const cleanDir = currentDir.split('?')[0].split('#')[0];
+
                 const url = "https://pan.baidu.com/api/list?" +
-                    `dir=${encodeURIComponent(currentDir)}&order=name&desc=0&showempty=0` +
+                    `dir=${encodeURIComponent(cleanDir)}&order=name&desc=0&showempty=0` +
                     `&web=1&page=1&num=1000&channel=chunlei&app_id=250528` +
                     `&bdstoken=${encodeURIComponent(bdstoken)}`;
+
+                console.log('[秒传工具] 百度网盘 API 请求信息:', {
+                    url: url.replace(bdstoken, '***'),  // 隐藏 token
+                    currentDir: cleanDir,
+                    originalCurrentDir: currentDir,
+                    bdstokenLength: bdstoken.length,
+                    bdstokenPrefix: bdstoken.substring(0, 8) + '...'
+                });
+
                 const text = await helper.get(url, { Referer: "https://pan.baidu.com/disk/main" });
                 const data = JSON.parse(text);
+
+                // errno=-7 通常是 bdstoken 无效或过期
+                if (data.errno === -7) {
+                    console.error('[秒传工具] bdstoken 已过期或无效。获取到的 bdstoken:', {
+                        length: bdstoken.length,
+                        prefix: bdstoken.substring(0, 8)
+                    });
+                    throw new Error("bdstoken 已过期或无效。\n\n请尝试：\n1. 完全关闭百度网盘页面\n2. 清除浏览器缓存\n3. 重新打开百度网盘并登录\n4. 再次点击生成秒传JSON\n\n如果问题持续，可能是百度网盘已更新认证机制，请反馈给脚本开发者。");
+                }
+
                 if (data.errno !== 0 || !Array.isArray(data.list)) {
                     throw new Error(`获取文件列表失败（errno=${data.errno}），请确认已登录百度网盘`);
                 }
@@ -3914,39 +4183,55 @@ function guangyaExtractMd5FromEtag(raw) {
     }
 
     function resolveTianyiContainer() {
-        const isMain = location.pathname.startsWith("/web/main");
-        if (!isMain) {
-            const shareSelectors = [
-                ".file-operate",
-                ".outlink-box-b .file-operate",
-                ".c-file-operate",
+        try {
+            const isMain = location.pathname.startsWith("/web/main");
+            if (!isMain) {
+                const shareSelectors = [
+                    ".file-operate",
+                    ".outlink-box-b .file-operate",
+                    ".c-file-operate",
+                ];
+                for (const s of shareSelectors) {
+                    try {
+                        const el = document.querySelector(s);
+                        if (el && !isInTianyiSidebar(el)) return el;
+                    } catch (e) {
+                        console.warn('[秒传工具] resolveTianyiContainer selector error:', s, e);
+                    }
+                }
+                return null;
+            }
+
+            const upload = findTianyiUploadAnchor();
+            if (upload && upload.parentElement && !isInTianyiSidebar(upload.parentElement)) {
+                return upload.parentElement;
+            }
+
+            const scored = resolveTianyiFileHeadToolbarScored();
+            if (scored) return scored;
+
+            const legacy = [
+                '[class*="FileHead_file-head-left"]',
+                ".FileHead_file-head-left",
+                ".file-head-left",
+                ".c-file-head__left",
             ];
-            for (const s of shareSelectors) {
-                const el = document.querySelector(s);
-                if (el && !isInTianyiSidebar(el)) return el;
+            for (const s of legacy) {
+                try {
+                    const els = document.querySelectorAll(s);
+                    for (let j = 0; j < els.length; j++) {
+                        const el = els[j];
+                        if (!isInTianyiSidebar(el)) return el;
+                    }
+                } catch (e) {
+                    console.warn('[秒传工具] resolveTianyiContainer legacy selector error:', s, e);
+                }
             }
             return null;
+        } catch (e) {
+            console.error('[秒传工具] resolveTianyiContainer error:', e);
+            return null;
         }
-        const upload = findTianyiUploadAnchor();
-        if (upload && upload.parentElement && !isInTianyiSidebar(upload.parentElement)) {
-            return upload.parentElement;
-        }
-        const scored = resolveTianyiFileHeadToolbarScored();
-        if (scored) return scored;
-        const legacy = [
-            '[class*="FileHead_file-head-left"]',
-            ".FileHead_file-head-left",
-            ".file-head-left",
-            ".c-file-head__left",
-        ];
-        for (const s of legacy) {
-            const els = document.querySelectorAll(s);
-            for (let j = 0; j < els.length; j++) {
-                const el = els[j];
-                if (!isInTianyiSidebar(el)) return el;
-            }
-        }
-        return null;
     }
 
     /** 生成按钮是否已挂在天翼主文件工具栏附近（非侧栏、非左上角 fixed 兜底） */
@@ -4389,7 +4674,26 @@ function guangyaExtractMd5FromEtag(raw) {
         ) {
             ensureTianyiShareToolbarFlexStyle();
         }
-        const observer = new MutationObserver(() => createButton());
+
+        // 添加防抖机制,避免天翼分享页 MutationObserver 触发过于频繁导致卡死
+        let createButtonTimer = null;
+        let isCreating = false;
+        const debouncedCreateButton = () => {
+            if (createButtonTimer) clearTimeout(createButtonTimer);
+            createButtonTimer = setTimeout(() => {
+                if (isCreating) return; // 防止重复执行
+                isCreating = true;
+                try {
+                    createButton();
+                } catch (e) {
+                    console.error('[秒传工具] createButton error:', e);
+                } finally {
+                    isCreating = false;
+                }
+            }, 100); // 100ms 防抖
+        };
+
+        const observer = new MutationObserver(debouncedCreateButton);
         observer.observe(obsRoot, { childList: true, subtree: true });
         createButton();
         [400, 1500, 4000, 8000].forEach((ms) => setTimeout(createButton, ms));
