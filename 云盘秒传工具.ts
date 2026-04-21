@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         云盘秒传工具（百度/夸克/天翼/123/光鸭）fix
-// @version      2026.04.20
-// @description  云盘秒传工具（百度/夸克/天翼/123/光鸭）修复天翼分享页卡死，百度不能导出
+// @version      2026.04.21
+// @description  云盘秒传工具（百度/夸克/天翼/123/光鸭）fix 
 // @run-at       document-idle
 // @match        https://pan.quark.cn/*
 // @match        https://drive.quark.cn/*
@@ -36,7 +36,7 @@
 (function () {
     "use strict";
 
-    const SCRIPT_VERSION = "2026.04.16";
+    const SCRIPT_VERSION = "2026.04.21";
     const GUANGYA_API_BASE = "https://api.guangyapan.com";
     const GUANGYA_CODE_RES_TOKEN_INSTANT = 156;
     const GUANGYA_CODE_DIR_EXISTS = 159;
@@ -579,6 +579,19 @@
                 i++;
             }
             return `${value.toFixed(2)} ${units[i]}`;
+        },
+
+        parseSize(sizeStr) {
+            // 将人类可读的大小字符串转换为字节数
+            // 例如: "10.5 MB" -> 11010048
+            if (!sizeStr || typeof sizeStr !== 'string') return 0;
+            const str = sizeStr.trim().toUpperCase();
+            const match = str.match(/^([d.]+)s*([KMGT]?B)?$/i);
+            if (!match) return 0;
+            const num = parseFloat(match[1]) || 0;
+            const unit = (match[2] || 'B').toUpperCase();
+            const multipliers = { 'B': 1, 'KB': 1024, 'MB': 1024*1024, 'GB': 1024*1024*1024, 'TB': 1024*1024*1024*1024 };
+            return Math.floor(num * (multipliers[unit] || 1));
         },
 
         normalizeFilePath(path) {
@@ -2690,7 +2703,6 @@
             return s.toLowerCase();
         },
 
-        /** 从页面全局变量或 script 标签提取 bdstoken */
         getBdstoken() {
             // 如果之前获取的 token 存在但已过期，可以通过刷新页面重新获取
             // 这里添加多种获取方式，优先级从高到低
@@ -2836,10 +2848,18 @@
         getSelectedFsIds() {
             const ids = new Set();
 
-            // 方法0：从 DOM data 属性直接获取（新增，最可靠）
+            // 🔧 v4：修复！方法0 必须只匹配【已选中】的行，否则会返回所有文件
             try {
-                const selectedItems = document.querySelectorAll('[data-id], [data-fs-id], [data-fsid]');
-                for (const el of selectedItems) {
+                const selectedRows = document.querySelectorAll(
+                    '.mouse-choose-item.selected[data-id], ' +
+                    '.mouse-choose-item.selected[data-fs-id], ' +
+                    '.mouse-choose-item.selected[data-fsid], ' +
+                    '.wp-s-pan-table__body-row.selected[data-id], ' +
+                    '.wp-s-pan-table__body-row.selected[data-fs-id], ' +
+                    '.wp-s-pan-table__body-row.selected[data-fsid], ' +
+                    '.ant-table-row-selected[data-id]'
+                );
+                for (const el of selectedRows) {
                     const id = el.getAttribute('data-id') ||
                               el.getAttribute('data-fs-id') ||
                               el.getAttribute('data-fsid');
@@ -2847,6 +2867,59 @@
                         ids.add(id);
                     }
                 }
+                if (ids.size) {
+                    console.log('[秒传工具] getSelectedFsIds (方式0-选中行data属性):', [...ids]);
+                    return [...ids];
+                }
+            } catch { /* ignore */ }
+
+            // 🔧 修复2：改进选中检测 - 检查DOM中的checkbox选中状态
+            try {
+                // 🔧 v2：添加百度网盘特有类名 mouse-choose-item 和 wp-s-pan-table__body-row
+                const checkedRows = document.querySelectorAll(
+                    '.mouse-choose-item.selected, ' +
+                    '.wp-s-pan-table__body-row.selected, ' +
+                    '.list-view .file-item.selected, ' +
+                    '.list-view .file-item[class*="selected"], ' +
+                    '.grid-view .file-item.selected, ' +
+                    '.grid-view .file-item[class*="selected"], ' +
+                    'tr[class*="selected"], ' +
+                    '[class*="file"][class*="selected"], ' +
+                    '.ant-table-row-selected'
+                );
+                
+                for (const row of checkedRows) {
+                    // 尝试从多种属性获取fs_id
+                    const attrs = ['data-id', 'data-fs-id', 'data-fsid', 'data-key', 'data-row-key'];
+                    for (const attr of attrs) {
+                        const id = row.getAttribute(attr);
+                        if (id && /^\d+$/.test(id)) {
+                            ids.add(id);
+                        }
+                    }
+                    
+                    // 从React fiber获取
+                    const fk = Object.keys(row).find((k) =>
+                        k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$"),
+                    );
+                    if (fk) {
+                        let fiber = row[fk];
+                        for (let i = 0; i < 30 && fiber; i++) {
+                            const mp = fiber.memoizedProps || fiber.pendingProps;
+                            if (mp && typeof mp === "object") {
+                                const item = mp.item || mp.file || mp.fileInfo || mp.data || mp.fileItem;
+                                if (item && typeof item === "object") {
+                                    const id = String(item.fs_id || item.fsId || "");
+                                    if (/^\d+$/.test(id)) ids.add(id);
+                                }
+                                const id = String(mp.fs_id || mp.fsId || "");
+                                if (/^\d+$/.test(id)) ids.add(id);
+                            }
+                            fiber = fiber.return;
+                        }
+                    }
+                }
+                
                 if (ids.size) return [...ids];
             } catch { /* ignore */ }
 
@@ -3033,27 +3106,123 @@
         /** 从选中行的 title 属性或文本内容提取文件名 */
         getSelectedFileNames() {
             const names = new Set();
+            
+            // 🔧 v6：多选择器适配不同版本百度页面
+            const activeSelectors = [
+                'dd.AuPKyz.JS-item-active',
+                'dd.AuPKyz.selected',
+                'dd[class*="AuPKyz"].selected',
+                '[class*="item-active"]',
+                '[class*="selected"][class*="file"]',
+                '.selected[data-fs-id]',
+                '[aria-selected="true"]',
+                '.mouse-choose-item.selected',
+                '.wp-s-pan-table__body-row.selected'
+            ];
+            
+            for (const sel of activeSelectors) {
+                const activeRows = document.querySelectorAll(sel);
+                if (activeRows.length > 0) {
+                    console.log(`[秒传工具] 从选择器 "${sel}" 提取选中文件名 (${activeRows.length} 行)`);
+                    for (const row of activeRows) {
+                        const filenameEl = row.querySelector('a.filename') ||
+                                          row.querySelector('[class*="filename"]') ||
+                                          row.querySelector('[class*="name"]') ||
+                                          row.querySelector('a[title]');
+                        if (filenameEl) {
+                            const title = filenameEl.getAttribute('title') || filenameEl.textContent || '';
+                            names.add(title.trim());
+                        }
+                    }
+                    if (names.size > 0) return [...names];
+                }
+            }
+            
+            // 🔧 v3/v4：百度个人主页特有类名 mouse-choose-item / wp-s-pan-table
             const candidates = [
+                ...document.querySelectorAll(".mouse-choose-item.selected"),
+                ...document.querySelectorAll(".wp-s-pan-table__body-row.selected"),
                 ...document.querySelectorAll("[class*='selected']"),
                 ...document.querySelectorAll("[aria-selected='true']"),
             ];
-            for (const el of candidates) {
-                if (el.tagName === "INPUT" || el.tagName === "BUTTON" || el.closest("thead")) continue;
-                // 优先子元素 title 属性（最稳定）
-                for (const te of el.querySelectorAll("[title]")) {
-                    const t = te.getAttribute("title") || "";
-                    if (t.length > 0 && t.length < 500 && !t.startsWith("http") && !t.includes("://")) {
-                        names.add(t);
-                        break;
+            
+            // 🔧 v3：清理文件名的函数（去除换行、重复、多余空格）
+            const cleanName = (raw) => {
+                if (!raw || typeof raw !== 'string') return '';
+                // 去除换行符及前后空白
+                let clean = raw.replace(/[\r\n\t]+/g, ' ').trim();
+                // 去除连续空格
+                clean = clean.replace(/\s{2,}/g, ' ');
+                // 如果文件名中出现了重复（如 "最佳拍档系列 最佳拍档系列"），取第一段
+                const half = Math.floor(clean.length / 2);
+                if (half > 3) {
+                    const firstHalf = clean.substring(0, half).trim();
+                    const secondHalf = clean.substring(half).trim();
+                    if (firstHalf === secondHalf) {
+                        clean = firstHalf;
                     }
                 }
-                // 自身 title
-                const st = el.getAttribute("title") || "";
-                if (st.length > 0 && st.length < 500 && !st.startsWith("http") && !st.includes("://")) {
-                    names.add(st);
+                // 过滤明显的非文件名
+                if (!clean || clean.length < 1 || clean.length > 500) return '';
+                if (clean.startsWith('http') || clean.includes('://')) return '';
+                if (['操作', '下载', '分享', '更多', '删除', '重命名', '移动', '复制', '收藏'].includes(clean)) return '';
+                return clean;
+            };
+            
+            for (const el of candidates) {
+                if (el.tagName === "INPUT" || el.tagName === "BUTTON" || el.closest("thead")) continue;
+                
+                // 🔧 v3：百度网盘文件名提取方式（优先级从高到低）
+                
+                // 方式1：查找百度网盘文件名元素（特定类名）
+                const filenameSelectors = [
+                    '.file-name',
+                    '.filename',
+                    '[class*="file-name"]',
+                    '[class*="fileName"]',
+                    '[class*="name-col"]',
+                    'td[class*="name"]',
+                    'a[title]',
+                    'span[title]'
+                ];
+                
+                for (const selector of filenameSelectors) {
+                    const filenameEl = el.querySelector(selector);
+                    if (filenameEl) {
+                        // 优先使用 title 属性
+                        const title = cleanName(filenameEl.getAttribute('title'));
+                        if (title) {
+                            names.add(title);
+                            break;
+                        }
+                        // 否则使用文本内容
+                        const text = cleanName(filenameEl.textContent);
+                        if (text) {
+                            names.add(text);
+                            break;
+                        }
+                    }
                 }
+                
+                // 方式2：子元素 title 属性
+                if (!names.has(cleanName(el.querySelector('[title]')?.getAttribute('title')))) {
+                    for (const te of el.querySelectorAll("[title]")) {
+                        const t = cleanName(te.getAttribute("title"));
+                        if (t) {
+                            names.add(t);
+                            break;
+                        }
+                    }
+                }
+                
+                // 方式3：自身 title
+                const st = cleanName(el.getAttribute("title"));
+                if (st) names.add(st);
             }
-            return [...names];
+            
+            const result = [...names];
+            console.log('[秒传工具] getSelectedFileNames 原始结果:', result);
+            return result;
         },
 
         /** 递归列出目录下所有文件 */
@@ -3084,7 +3253,9 @@
 
                     if (data.errno !== 0 || !Array.isArray(data.list)) break;
                     for (const item of data.list) {
-                        const itemPath = pathPrefix ? `${pathPrefix}/${item.server_filename}` : item.server_filename;
+                        // 🔧 修复3：处理文件夹名称中的&符号
+                        const itemName = item.server_filename.replace(/&/g, ' ');
+                        const itemPath = pathPrefix ? `${pathPrefix}/${itemName}` : itemName;
                         if (item.isdir === 1) {
                             files.push(...(await this.listDir(item.path, itemPath)));
                         } else {
@@ -3137,11 +3308,13 @@
 
                     if (data.errno === 0 && Array.isArray(data.info)) {
                         for (const item of data.info) {
+                        // 🔧 修复3：处理文件名中的&符号
+                        const filename = String(item.filename || item.server_filename || "").replace(/&/g, ' ');
                         result[String(item.fs_id)] = {
                             md5: this.decodeBaiduMd5(item.md5),
-                                path: String(item.path || ""),
+                                path: String(item.path || "").replace(/&/g, ' '),
                                 size: Number(item.size || 0),
-                                filename: String(item.filename || item.server_filename || ""),
+                                filename: filename,
                                 isdir: item.isdir === 1,
                             };
                         }
@@ -3155,12 +3328,16 @@
         },
 
         async collectFiles() {
+            // 百度个人主页逻辑
             const output = [];
             const folderItems = [];
 
             // 方式一：fs_id（React fiber / Redux）
             const fsIds = this.getSelectedFsIds();
+            console.log('[秒传工具] getSelectedFsIds 结果:', fsIds);
+            
             if (fsIds.length) {
+                console.log('[秒传工具] 使用方式一：fs_id 匹配');
                 helper.updateLoadingMsg("正在获取文件信息...");
                 const metas = await this.getFileMetas(fsIds);
                 for (const id of fsIds) {
@@ -3176,7 +3353,9 @@
 
             // 方式二：DOM 文件名 + list API 匹配（兜底）
             if (!output.length && !folderItems.length) {
+                console.log('[秒传工具] 使用方式二：DOM文件名匹配');
                 const selectedNames = this.getSelectedFileNames();
+                console.log('[秒传工具] getSelectedFileNames 结果:', selectedNames);
                 if (!selectedNames.length) throw new Error("请先在百度网盘勾选要导出的文件或文件夹");
 
                 const currentDir = this.getCurrentDir();
@@ -3219,8 +3398,23 @@
                     throw new Error(`获取文件列表失败（errno=${data.errno}），请确认已登录百度网盘`);
                 }
                 const nameSet = new Set(selectedNames);
+                // 🔧 v3：使用模糊匹配（忽略首尾空格、换行符差异）
+                const fuzzyMatch = (serverName, selectedName) => {
+                    if (serverName === selectedName) return true;
+                    const normalize = (s) => s.replace(/[\s\r\n]+/g, ' ').trim();
+                    if (normalize(serverName) === normalize(selectedName)) return true;
+                    // 去除重复后的匹配
+                    const normSelected = normalize(selectedName);
+                    const half = Math.floor(normSelected.length / 2);
+                    if (half > 3) {
+                        const firstHalf = normSelected.substring(0, half);
+                        if (normalize(serverName) === firstHalf) return true;
+                    }
+                    return false;
+                };
                 for (const item of data.list) {
-                    if (!nameSet.has(item.server_filename)) continue;
+                    const matched = selectedNames.some(name => fuzzyMatch(item.server_filename, name));
+                    if (!matched) continue;
                     if (item.isdir === 1) {
                         folderItems.push({ baiduPath: item.path, name: item.server_filename });
                     } else {
@@ -4633,6 +4827,8 @@ function guangyaExtractMd5FromEtag(raw) {
             if (!found) return;
             container = found;
         } else if (baidu.isBaiduHost()) {
+            // 百度分享页不显示导出按钮（无法获取MD5）
+            if (/^\/(s|share)\//.test(location.pathname)) return;
             matchedHost = true;
             // 挂到 html 元素，避免百度 SPA 替换 body 内容时按钮丢失导致重复创建
             container = document.documentElement;
