@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         云盘秒传工具（百度/夸克/天翼/123/光鸭）fix
-// @version      2026.04.21
-// @description  云盘秒传工具（百度/夸克/天翼/123/光鸭）fix 
+// @name         云盘秒传工具2.0（百度/夸克/天翼/123/迅雷/光鸭）
+// @version      2026.04.24
+// @description  云盘秒传工具2.0（百度/夸克/天翼/123/迅雷/光鸭）
 // @run-at       document-idle
 // @match        https://pan.quark.cn/*
 // @match        https://drive.quark.cn/*
@@ -17,6 +17,7 @@
 // @match        https://pan.baidu.com/*
 // @match        https://guangyapan.com/*
 // @match        https://*.guangyapan.com/*
+// @match        https://pan.xunlei.com/*
 // @grant        GM_setClipboard
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -29,6 +30,7 @@
 // @connect      cloud.189.cn
 // @connect      pan.baidu.com
 // @connect      api.guangyapan.com
+// @connect      api-pan.xunlei.com
 // ==/UserScript==
 
 // @ts-nocheck
@@ -36,13 +38,18 @@
 (function () {
     "use strict";
 
-    const SCRIPT_VERSION = "2026.04.21";
+    const SCRIPT_VERSION = "2026.04.24";
     const GUANGYA_API_BASE = "https://api.guangyapan.com";
     const GUANGYA_CODE_RES_TOKEN_INSTANT = 156;
     const GUANGYA_CODE_DIR_EXISTS = 159;
     const GUANGYA_URL_GET_RES_CENTER_TOKEN = `${GUANGYA_API_BASE}/nd.bizuserres.s/v1/get_res_center_token`;
+    const GUANGYA_URL_CHECK_FLASH_UPLOAD = `${GUANGYA_API_BASE}/nd.bizuserres.s/v1/check_can_flash_upload`;
     const GUANGYA_URL_CREATE_DIR = `${GUANGYA_API_BASE}/nd.bizuserres.s/v1/file/create_dir`;
     const GUANGYA_URL_DELETE_UPLOAD_TASK = `${GUANGYA_API_BASE}/nd.bizuserres.s/v1/file/delete_upload_task`;
+
+    const XUNLEI_API_BASE = "https://api-pan.xunlei.com";
+    const XUNLEI_CLIENT_ID = "Xqp0kJBXWhwaTpB6";
+    const BTN_XUNLEI_JSON_ID = "guangya-xunlei-json-btn";
 
     const KEY_GUANGYA_ACCESS_TOKEN = "guangya_guangyapan_access_token";
     const BTN_GUANGYA_IMPORT_ID = "guangya-guangya-import-json-btn";
@@ -86,7 +93,7 @@
             return {
                 ok: false,
                 message:
-                    '须包含数组字段 files，例如：{"files":[{"path":"…","etag":"…","size":0},…]}',
+                    '须包含数组字段 files，例如：{"files":[{"path":"…","etag":"…","size":0},…]} 或迅雷格式：{"files":[{"path":"…","gcid":"…","size":0},…]}',
             };
         }
         if (obj.files.length === 0) {
@@ -700,9 +707,9 @@
                     <pre id="guangya-json-preview" style="margin:0;white-space:pre-wrap;word-break:break-all;">${jsonStr}</pre>
                   </div>
                   <div style="display:flex;gap:10px;justify-content:flex-end;">
-                    <button id="guangya-result-copy" style="padding:8px 20px;background:#ff9800;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">复制 JSON</button>
-                    <button id="guangya-result-download" style="padding:8px 20px;background:#4caf50;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;">下载文件</button>
-                    <button id="guangya-result-close" style="padding:8px 20px;background:#e0e0e0;color:#333;border:none;border-radius:6px;cursor:pointer;">关闭</button>
+                    <button id="guangya-result-copy" style="padding:8px 20px;background:#ff9800;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;font-size:14px;">复制 JSON</button>
+                    <button id="guangya-result-download" style="padding:8px 20px;background:#4caf50;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;font-size:14px;">下载文件</button>
+                    <button id="guangya-result-close" style="padding:8px 20px;background:#e0e0e0;color:#333;border:none;border-radius:6px;cursor:pointer;font-size:14px;">关闭</button>
                   </div>
                 </div>
               </div>`;
@@ -765,6 +772,16 @@
                 .filter((f) => f && f.path)
                 .map((f) => {
                     const path = this.normalizeFilePath(f.path);
+                    // gcid模式（迅雷云盘导出）
+                    const gcid = this.normalizeEtag(f.gcid || "");
+                    if (gcid) {
+                        return {
+                            gcid,
+                            size: String(f.size ?? 0),
+                            path,
+                            __valid: true,
+                        };
+                    }
                     const etag = this.normalizeEtag(f.etag || "");
                     const hasEtag = etag.length > 0;
                     if (!hasEtag) {
@@ -3444,6 +3461,238 @@
         },
     };
 
+    const panXunlei = {
+        isHost() {
+            return location.hostname === "pan.xunlei.com";
+        },
+
+        getAuthHeaders() {
+            const token = this._cachedToken || "";
+            const deviceId = this._cachedDeviceId || "";
+            const captchaToken = this._cachedCaptchaToken || "";
+            const clientId = this._cachedClientId || XUNLEI_CLIENT_ID;
+            const h = {
+                "Content-Type": "application/json",
+                "x-client-id": clientId,
+                "Referer": "https://pan.xunlei.com/",
+            };
+            if (token) h["Authorization"] = `Bearer ${token}`;
+            if (deviceId) h["x-device-id"] = deviceId;
+            if (captchaToken) h["x-captcha-token"] = captchaToken;
+            return h;
+        },
+
+        _cachedToken: "",
+        _cachedDeviceId: "",
+        _cachedCaptchaToken: "",
+        _cachedClientId: "",
+
+        installTokenInterceptor() {
+            if (this._interceptorInstalled) return;
+            this._interceptorInstalled = true;
+            const self = this;
+            const origOpen = XMLHttpRequest.prototype.open;
+            const origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+            XMLHttpRequest.prototype.open = function(method, url) {
+                this._url = url;
+                this._headers = {};
+                return origOpen.apply(this, arguments);
+            };
+            XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+                if (this._headers) this._headers[String(name).toLowerCase()] = value;
+                return origSetHeader.apply(this, arguments);
+            };
+            const origSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.send = function() {
+                if (this._url && String(this._url).includes("api-pan.xunlei.com") && this._headers) {
+                    const auth = this._headers["authorization"] || "";
+                    if (auth.startsWith("Bearer ")) {
+                        self._cachedToken = auth.slice(7).trim();
+                    }
+                    const did = this._headers["x-device-id"] || "";
+                    if (did) self._cachedDeviceId = did;
+                    const ct = this._headers["x-captcha-token"] || "";
+                    if (ct) self._cachedCaptchaToken = ct;
+                    const cid = this._headers["x-client-id"] || "";
+                    if (cid) self._cachedClientId = cid;
+                }
+                return origSend.apply(this, arguments);
+            };
+            // 同时拦截fetch
+            const origFetch = unsafeWindow.fetch || window.fetch;
+            const patchedFetch = function(input, init) {
+                const url = typeof input === "string" ? input : input?.url || "";
+                if (url.includes("api-pan.xunlei.com") && init && init.headers) {
+                    const headers = init.headers;
+                    const getH = (k) => {
+                        if (typeof headers.get === "function") return headers.get(k) || "";
+                        if (typeof headers === "object") {
+                            for (const key of Object.keys(headers)) {
+                                if (key.toLowerCase() === k.toLowerCase()) return headers[key];
+                            }
+                        }
+                        return "";
+                    };
+                    const auth = getH("authorization");
+                    if (auth.startsWith("Bearer ")) self._cachedToken = auth.slice(7).trim();
+                    const did = getH("x-device-id");
+                    if (did) self._cachedDeviceId = did;
+                    const ct = getH("x-captcha-token");
+                    if (ct) self._cachedCaptchaToken = ct;
+                    const cid = getH("x-client-id");
+                    if (cid) self._cachedClientId = cid;
+                }
+                return origFetch.apply(this, arguments);
+            };
+            if (unsafeWindow && unsafeWindow.fetch) {
+                unsafeWindow.fetch = patchedFetch;
+            } else {
+                window.fetch = patchedFetch;
+            }
+        },
+
+        async getFilesInFolder(parentId, pathPrefix, onProgress) {
+            const results = [];
+            let pageToken = "";
+            const filters = encodeURIComponent(JSON.stringify({
+                phase: { eq: "PHASE_TYPE_COMPLETE" },
+                trashed: { eq: false },
+            }));
+            do {
+                const url = `${XUNLEI_API_BASE}/drive/v1/files?parent_id=${encodeURIComponent(parentId)}&usage=DISPLAY&filters=${filters}&with_audit=true&thumbnail_size=SIZE_SMALL&limit=100&page_token=${encodeURIComponent(pageToken)}`;
+                const respText = await helper.get(url, this.getAuthHeaders());
+                const resp = JSON.parse(respText);
+                const files = resp.files || [];
+                for (const f of files) {
+                    if (f.kind === "drive#folder") {
+                        const subPath = pathPrefix ? `${pathPrefix}/${f.name}` : f.name;
+                        const subFiles = await this.getFilesInFolder(f.id, subPath, onProgress);
+                        results.push(...subFiles);
+                    } else {
+                        const gcid = f.hash || "";
+                        if (!gcid) continue; // 跳过没有gcid的文件（如空文件夹）
+                        const filePath = pathPrefix ? `${pathPrefix}/${f.name}` : f.name;
+                        results.push({
+                            path: filePath,
+                            gcid,
+                            size: Number(f.size) || 0,
+                        });
+                    }
+                }
+                pageToken = resp.next_page_token || "";
+                if (onProgress) onProgress(results.length);
+            } while (pageToken);
+            return results;
+        },
+
+        async collectFiles(selectedIds) {
+            // 优先从 Vuex drive.all 缓存读取文件信息（无需额外网络请求）
+            const store = this._getVueStore();
+            const driveAll = store?.state?.drive?.all || {};
+
+            const results = [];
+            for (const id of selectedIds) {
+                const f = driveAll[id];
+                if (!f) continue;
+                if (f.kind === "drive#folder") {
+                    helper.updateLoadingMsg(`正在递归获取文件夹：${f.name}...`);
+                    const subFiles = await this.getFilesInFolder(f.id, f.name, (count) => {
+                        helper.updateLoadingMsg(`正在递归获取文件夹：${f.name}（已找到 ${count} 个文件）`);
+                    });
+                    results.push(...subFiles);
+                } else {
+                    const gcid = f.hash || "";
+                    if (!gcid) continue;
+                    results.push({ path: f.name, gcid, size: Number(f.size) || 0 });
+                }
+            }
+            return results;
+        },
+
+        _getVueStore() {
+            const el = document.querySelector("[class*='SourceListItem__item']");
+            return el?.__vue__?.$store || null;
+        },
+
+        getSelectedIds() {
+            // 迅雷云盘是 Vue 2 SPA，文件 id 存在 Vuex store 而非 DOM 属性
+            // selected prop 存在列表项组件上
+            const items = document.querySelectorAll("[class*='SourceListItem__item']");
+            for (const el of items) {
+                const vue = el.__vue__;
+                if (!vue) continue;
+                const selected = vue.$props?.selected;
+                if (Array.isArray(selected) && selected.length > 0) return selected;
+            }
+            // 若没有勾选项，尝试从 store 读取当前目录所有 id（全选场景）
+            const store = this._getVueStore();
+            if (store) {
+                const doneIds = store.state?.drive?.lists?.["-done"];
+                if (Array.isArray(doneIds) && doneIds.length > 0) return doneIds;
+            }
+            return [];
+        },
+
+        injectButton() {
+            if (document.getElementById(BTN_XUNLEI_JSON_ID)) return;
+            const btn = document.createElement("button");
+            btn.id = BTN_XUNLEI_JSON_ID;
+            btn.type = "button";
+            btn.style.cssText =
+                "box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;" +
+                "height:40px;min-height:40px;padding:0 22px;margin-left:8px;" +
+                "border-radius:8px;white-space:nowrap;cursor:pointer;vertical-align:middle;" +
+                "background:#ff9800 !important;border:1px solid #ff9800 !important;color:#fff !important;" +
+                "font-size:18px;line-height:1.45;font-weight:500;" +
+                "font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,\"Helvetica Neue\",Arial," +
+                "\"PingFang SC\",\"Hiragino Sans GB\",\"Microsoft YaHei\",sans-serif;";
+            const span = document.createElement("span");
+            span.textContent = "生成秒传JSON";
+            span.style.cssText = "font-size:18px;line-height:1.45;font-weight:500;";
+            btn.appendChild(span);
+            const setLabel = (t) => { span.textContent = t; };
+            btn.onclick = async () => {
+                try {
+                    btn.disabled = true;
+                    setLabel("生成中...");
+                    await generateXunlei();
+                    setLabel("生成秒传JSON");
+                } catch (e) {
+                    alert(e?.message || "生成失败");
+                    setLabel("生成秒传JSON");
+                } finally {
+                    btn.disabled = false;
+                }
+            };
+
+            // 插入到迅雷工具栏（FileMenu）
+            const tryInsert = () => {
+                if (document.getElementById(BTN_XUNLEI_JSON_ID)) return true;
+                const menu = document.querySelector("[class*='FileMenu__menu']");
+                if (!menu) return false;
+                // 插在第一个 primary 按钮（传输列表）之前
+                const primaryItem = menu.querySelector("[class*='FileMenu__item'][class*='primary'], [class*='FileMenu__item--'][class*='primary']");
+                menu.insertBefore(btn, primaryItem || menu.firstChild);
+                return true;
+            };
+            if (tryInsert()) return;
+            // 工具栏还未渲染，等待 DOM 出现
+            const observer = new MutationObserver(() => {
+                if (tryInsert()) observer.disconnect();
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
+            // 超时兜底：悬浮按钮
+            setTimeout(() => {
+                if (document.getElementById(BTN_XUNLEI_JSON_ID)) return;
+                observer.disconnect();
+                btn.style.cssText +=
+                    "position:fixed;right:24px;top:70px;z-index:2147483647;" +
+                    "box-shadow:0 4px 18px rgba(255,152,0,.5),0 2px 8px rgba(0,0,0,.18);";
+                document.body.appendChild(btn);
+            }, 8000);
+        },
+    };
+
     /** 判断是否为文件名违禁词错误（光鸭 code=166），可安全跳过并继续下一个文件 */
     function isGuangyaForbiddenNameError(err) {
         if (!err) return false;
@@ -3630,7 +3879,7 @@ function guangyaExtractMd5FromEtag(raw) {
             hint.style.cssText =
                 "margin:0 0 8px;font-size:12px;line-height:1.5;color:#555;";
             hint.innerHTML =
-                "可<strong>粘贴</strong> JSON 或<strong>选择单个 .json 文件</strong>（<code>files</code>：path、<code>etag</code>=32 位十六进制 MD5、size）。<br>选择文件后会<strong>自动校验</strong> JSON 结构；不符则不会填入下方。<br>可点「清除」去掉已选文件并清空下方内容后重新选择。";
+                "可<strong>粘贴</strong> JSON 或<strong>选择单个 .json 文件</strong>（<code>files</code>：path、<code>etag</code>=32 位十六进制 MD5、<code>gcid</code>=迅雷GCID、size）。<br>选择文件后会<strong>自动校验</strong> JSON 结构；不符则不会填入下方。<br>可点「清除」去掉已选文件并清空下方内容后重新选择。";
             const fileRow = document.createElement("div");
             fileRow.style.cssText =
                 "margin:10px 0 8px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;";
@@ -3698,7 +3947,7 @@ function guangyaExtractMd5FromEtag(raw) {
             fileRow.appendChild(btnClearFile);
             fileRow.appendChild(fileLoadedHint);
             const ta = document.createElement("textarea");
-            ta.placeholder = '{"files":[{"path":"a.mp4","etag":"…32位md5…","size":123}]}';
+            ta.placeholder = '{"files":[{"path":"a.mp4","etag":"…32位md5…","gcid":"迅雷GCID","size":123}]}';
             ta.style.cssText =
                 "width:100%;box-sizing:border-box;min-height:180px;padding:10px;border:1px solid #ccc;border-radius:6px;font-size:12px;font-family:ui-monospace,monospace;margin-top:4px;";
             const status = document.createElement("div");
@@ -3998,6 +4247,18 @@ function guangyaExtractMd5FromEtag(raw) {
                 const nameStr = String(f.name || "").trim();
                 const fullPath = pathStr || nameStr || "file";
                 const numSize = Number(f.size != null ? f.size : 0);
+                // gcid模式（迅雷导出）
+                const gcidRaw = String(f.gcid || "").trim().toUpperCase();
+                if (gcidRaw) {
+                    files.push({
+                        gcid: gcidRaw,
+                        filePath: fullPath,
+                        fileName: guangyaBasenameFromPath(fullPath),
+                        dirSegments: guangyaDirSegmentsFromPath(fullPath),
+                        fileSize: Number.isFinite(numSize) && numSize >= 0 ? numSize : 0,
+                    });
+                    continue;
+                }
                 const ex = guangyaExtractMd5FromEtag(f.etag || f.md5);
                 if (!ex.ok) {
                     skip.push(`${fullPath}：${ex.reason}`);
@@ -4014,7 +4275,7 @@ function guangyaExtractMd5FromEtag(raw) {
 
             if (!files.length) {
                 const preview = skip.slice(0, 5).join("\n");
-                const msg = `没有可用的有效 MD5，常见原因：etag 虽 32 位但含字母 p/n 等非十六进制字符（不是标准 MD5）。\n${preview}${skip.length > 5 ? "\n…" : ""}`;
+                const msg = `没有可用的有效 MD5 或 gcid，常见原因：etag 虽 32 位但含字母 p/n 等非十六进制字符（不是标准 MD5）。\n${preview}${skip.length > 5 ? "\n…" : ""}`;
                 const err = new Error(msg);
                 err.guangyaDetail = guangyaJsonDetail({
                     summary: "无有效 MD5 条目",
@@ -4109,6 +4370,7 @@ function guangyaExtractMd5FromEtag(raw) {
                 }
                 payloadFiles.push({
                     md5: row.md5,
+                    gcid: row.gcid,
                     filePath: row.filePath,
                     fileName: row.fileName,
                     fileSize: row.fileSize,
@@ -4128,7 +4390,7 @@ function guangyaExtractMd5FromEtag(raw) {
             const pushFailRow = (row) => {
                 aggTransferFail += 1;
                 transferFailedEntries.push({
-                    md5: row.md5,
+                    md5: row.md5 || row.gcid || "",
                     filePath: row.filePath,
                 });
             };
@@ -4149,51 +4411,100 @@ function guangyaExtractMd5FromEtag(raw) {
                 }
                 await helper.sleep(0);
                 try {
-                    const { data: apiBody } = await helper.postJsonGuangya(
-                        GUANGYA_URL_GET_RES_CENTER_TOKEN,
-                        {
-                            capacity: 1,
-                            res: {
-                                md5: row.md5,
-                                fileSize: row.fileSize,
+                    if (row.gcid) {
+                        // gcid秒传路径（迅雷导出）
+                        // 第一步：get_res_center_token 不传md5
+                        const { data: tokenBody } = await helper.postJsonGuangya(
+                            GUANGYA_URL_GET_RES_CENTER_TOKEN,
+                            {
+                                capacity: 1,
+                                res: { fileSize: row.fileSize },
+                                name: row.fileName || guangyaBasenameFromPath(row.filePath),
+                                parentId: String(row.parentId || ""),
                             },
-                            name: row.fileName || guangyaBasenameFromPath(row.filePath),
-                            parentId: String(row.parentId || ""),
-                        },
-                        token,
-                        {
-                            allowedBusinessCodes: [
-                                0,
-                                GUANGYA_CODE_RES_TOKEN_INSTANT,
-                            ],
-                        },
-                    );
-                    lastResp = apiBody;
-                    const code = apiBody && apiBody.code;
-                    if (code === GUANGYA_CODE_RES_TOKEN_INSTANT) {
-                        instantHitCount += 1;
-                        aggTransferOk += 1;
-                    } else {
-                        const d = apiBody && apiBody.data;
-                        const tid =
-                            d &&
-                            (d.taskId != null
-                                ? d.taskId
-                                : d.task_id != null
-                                  ? d.task_id
-                                  : "");
-                        if (tid !== "" && tid != null) {
+                            token,
+                            { allowedBusinessCodes: [0, GUANGYA_CODE_RES_TOKEN_INSTANT] },
+                        );
+                        lastResp = tokenBody;
+                        const tokenData = tokenBody && tokenBody.data;
+                        const taskId = tokenData && (tokenData.taskId != null ? tokenData.taskId : tokenData.task_id);
+                        if (!taskId) {
+                            pushFailRow(row);
+                            continue;
+                        }
+                        // 第二步：check_can_flash_upload 传真实gcid
+                        const { data: checkBody } = await helper.postJsonGuangya(
+                            GUANGYA_URL_CHECK_FLASH_UPLOAD,
+                            { taskId: String(taskId), gcid: row.gcid },
+                            token,
+                            { allowedBusinessCodes: [0] },
+                        );
+                        lastResp = checkBody;
+                        const canFlash = checkBody && checkBody.data && checkBody.data.canFlashUpload;
+                        if (canFlash) {
+                            instantHitCount += 1;
+                            aggTransferOk += 1;
+                        } else {
+                            // 秒传失败，删除任务
                             try {
                                 await helper.postJsonGuangya(
                                     GUANGYA_URL_DELETE_UPLOAD_TASK,
-                                    { taskIds: [String(tid)] },
+                                    { taskIds: [String(taskId)] },
                                     token,
                                 );
                             } catch {
                                 /* ignore */
                             }
+                            pushFailRow(row);
                         }
-                        pushFailRow(row);
+                    } else {
+                        // md5秒传路径（原有逻辑）
+                        const { data: apiBody } = await helper.postJsonGuangya(
+                            GUANGYA_URL_GET_RES_CENTER_TOKEN,
+                            {
+                                capacity: 1,
+                                res: {
+                                    md5: row.md5,
+                                    fileSize: row.fileSize,
+                                },
+                                name: row.fileName || guangyaBasenameFromPath(row.filePath),
+                                parentId: String(row.parentId || ""),
+                            },
+                            token,
+                            {
+                                allowedBusinessCodes: [
+                                    0,
+                                    GUANGYA_CODE_RES_TOKEN_INSTANT,
+                                ],
+                            },
+                        );
+                        lastResp = apiBody;
+                        const code = apiBody && apiBody.code;
+                        if (code === GUANGYA_CODE_RES_TOKEN_INSTANT) {
+                            instantHitCount += 1;
+                            aggTransferOk += 1;
+                        } else {
+                            const d = apiBody && apiBody.data;
+                            const tid =
+                                d &&
+                                (d.taskId != null
+                                    ? d.taskId
+                                    : d.task_id != null
+                                      ? d.task_id
+                                      : "");
+                            if (tid !== "" && tid != null) {
+                                try {
+                                    await helper.postJsonGuangya(
+                                        GUANGYA_URL_DELETE_UPLOAD_TASK,
+                                        { taskIds: [String(tid)] },
+                                        token,
+                                    );
+                                } catch {
+                                    /* ignore */
+                                }
+                            }
+                            pushFailRow(row);
+                        }
                     }
                 } catch (apiErr) {
                     if (isGuangyaForbiddenNameError(apiErr)) {
@@ -4231,6 +4542,32 @@ function guangyaExtractMd5FromEtag(raw) {
             };
         },
     };
+
+    async function generateXunlei() {
+        if (!panXunlei._cachedToken) {
+            throw new Error(
+                "未检测到迅雷云盘登录态（Bearer token）。\n" +
+                "请在已登录状态下，先点击一次文件列表（触发API请求），再点击『生成秒传JSON』。"
+            );
+        }
+        const selectedIds = panXunlei.getSelectedIds();
+        if (!selectedIds.length) {
+            throw new Error("请先勾选要导出的文件或文件夹，再点击『生成秒传JSON』。");
+        }
+        helper.showLoadingDialog("正在生成迅雷秒传 JSON", "正在获取文件信息...");
+        try {
+            const files = await panXunlei.collectFiles(selectedIds);
+            if (!files.length) {
+                throw new Error("所选项中没有可导出的文件（文件夹为空或文件没有 gcid）。");
+            }
+            const jsonData = helper.makeJson(files);
+            helper.closeLoadingDialog();
+            helper.showResultDialog(jsonData, "");
+        } catch (e) {
+            helper.closeLoadingDialog();
+            throw e;
+        }
+    }
 
     async function generate() {
         const host = location.hostname;
@@ -4664,7 +5001,7 @@ function guangyaExtractMd5FromEtag(raw) {
         span.style.setProperty("font-weight", "500", "important");
         let css =
             "box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;" +
-            "height:44px;min-height:44px;padding:0 22px;" +
+            "height:40px;min-height:40px;padding:0 22px;" +
             "border-radius:8px;white-space:nowrap;cursor:pointer;vertical-align:middle;" +
             "background:#ff9800 !important;border:1px solid #ff9800 !important;color:#fff !important;" +
             "font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,\"Helvetica Neue\",Arial," +
@@ -4733,7 +5070,7 @@ function guangyaExtractMd5FromEtag(raw) {
         };
         let css =
             "box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;" +
-            "height:44px;min-height:44px;padding:0 22px;margin-right:8px;" +
+            "height:40px;min-height:40px;padding:0 22px;margin-right:8px;" +
             "border-radius:8px;white-space:nowrap;" +
             "cursor:pointer;vertical-align:middle;" +
             "background:#ff9800 !important;border-color:#ff9800 !important;color:#fff !important;" +
@@ -4774,6 +5111,11 @@ function guangyaExtractMd5FromEtag(raw) {
 
     function createButton() {
         const host = location.hostname;
+
+        if (panXunlei.isHost()) {
+            panXunlei.injectButton();
+            return;
+        }
 
         if (panGuangya.isHost()) {
             if (tryMountGuangyaBesideUpload()) return;
@@ -4857,12 +5199,18 @@ function guangyaExtractMd5FromEtag(raw) {
             !location.hostname.includes("cloud.189.cn") &&
             !pan123.is123Host() &&
             !baidu.isBaiduHost() &&
-            !panGuangya.isHost()
+            !panGuangya.isHost() &&
+            !panXunlei.isHost()
         ) {
             return;
         }
         const obsRoot = document.body || document.documentElement;
         if (!obsRoot) return;
+
+        if (panXunlei.isHost()) {
+            panXunlei.installTokenInterceptor();
+        }
+
         injectGuangyaButtonTypographyStyles();
         if (
             location.hostname.includes("cloud.189.cn") &&
