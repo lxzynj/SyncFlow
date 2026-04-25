@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         云盘秒传工具2.0（百度/夸克/天翼/123/迅雷/光鸭）
-// @version      2026.04.24
+// @version      2026.04.25
 // @description  云盘秒传工具2.0（百度/夸克/天翼/123/迅雷/光鸭）
 // @run-at       document-idle
 // @match        https://pan.quark.cn/*
@@ -38,7 +38,7 @@
 (function () {
     "use strict";
 
-    const SCRIPT_VERSION = "2026.04.24";
+    const SCRIPT_VERSION = "2026.04.25";
     const GUANGYA_API_BASE = "https://api.guangyapan.com";
     const GUANGYA_CODE_RES_TOKEN_INSTANT = 156;
     const GUANGYA_CODE_DIR_EXISTS = 159;
@@ -50,6 +50,7 @@
     const XUNLEI_API_BASE = "https://api-pan.xunlei.com";
     const XUNLEI_CLIENT_ID = "Xqp0kJBXWhwaTpB6";
     const BTN_XUNLEI_JSON_ID = "guangya-xunlei-json-btn";
+    const BTN_XUNLEI_SHARE_JSON_ID = "guangya-xunlei-share-json-btn";
 
     const KEY_GUANGYA_ACCESS_TOKEN = "guangya_guangyapan_access_token";
     const BTN_GUANGYA_IMPORT_ID = "guangya-guangya-import-json-btn";
@@ -3624,12 +3625,6 @@
                 const selected = vue.$props?.selected;
                 if (Array.isArray(selected) && selected.length > 0) return selected;
             }
-            // 若没有勾选项，尝试从 store 读取当前目录所有 id（全选场景）
-            const store = this._getVueStore();
-            if (store) {
-                const doneIds = store.state?.drive?.lists?.["-done"];
-                if (Array.isArray(doneIds) && doneIds.length > 0) return doneIds;
-            }
             return [];
         },
 
@@ -3640,15 +3635,15 @@
             btn.type = "button";
             btn.style.cssText =
                 "box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;" +
-                "height:40px;min-height:40px;padding:0 22px;margin-left:8px;" +
-                "border-radius:8px;white-space:nowrap;cursor:pointer;vertical-align:middle;" +
+                "height:36px;min-height:36px;padding:0 12px;margin-left:8px;" +
+                "border-radius:4px;white-space:nowrap;cursor:pointer;vertical-align:middle;" +
                 "background:#ff9800 !important;border:1px solid #ff9800 !important;color:#fff !important;" +
-                "font-size:18px;line-height:1.45;font-weight:500;" +
+                "font-size:13px;line-height:1.45;font-weight:500;" +
                 "font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,\"Helvetica Neue\",Arial," +
                 "\"PingFang SC\",\"Hiragino Sans GB\",\"Microsoft YaHei\",sans-serif;";
             const span = document.createElement("span");
             span.textContent = "生成秒传JSON";
-            span.style.cssText = "font-size:18px;line-height:1.45;font-weight:500;";
+            span.style.cssText = "font-size:13px;line-height:1.45;font-weight:500;";
             btn.appendChild(span);
             const setLabel = (t) => { span.textContent = t; };
             btn.onclick = async () => {
@@ -3690,6 +3685,188 @@
                     "box-shadow:0 4px 18px rgba(255,152,0,.5),0 2px 8px rgba(0,0,0,.18);";
                 document.body.appendChild(btn);
             }, 8000);
+        },
+
+        isSharePage() {
+            return location.hostname === "pan.xunlei.com" && /^\/s\//.test(location.pathname);
+        },
+
+        getShareId() {
+            const m = location.pathname.match(/^\/s\/([^/?#]+)/);
+            return m ? m[1] : "";
+        },
+
+        getPassCode() {
+            return new URLSearchParams(location.search).get("pwd") || "";
+        },
+
+        _getShareStore() {
+            const el = document.querySelector("[class*='Share__']");
+            return el?.__vue__?.$store || el?.__vue__?.$root?.$store || null;
+        },
+
+        getPassCodeToken() {
+            const store = this._getShareStore();
+            return store?.state?.share?.shareInfo?.passCodeToken || "";
+        },
+
+        getShareSelectedIds() {
+            const store = this._getShareStore();
+            const share = store?.state?.share;
+
+            // 1. store 字段名枚举（部分版本可能有效）
+            if (share) {
+                for (const key of ["checkedFileIds", "selectedFileIds", "selectedIds", "checkedIds", "selected"]) {
+                    const v = share[key];
+                    if (Array.isArray(v) && v.length > 0) return v;
+                }
+            }
+
+            // 2. 用 share.list（有序文件 ID 列表）+ DOM checkbox 位置索引映射
+            // share.list 与 DOM 文件行一一对应，checkbox 的 checked 状态即为勾选
+            const listIds = share?.list;
+            if (Array.isArray(listIds) && listIds.length > 0) {
+                // 找所有文件行的 checkbox（排除"全选"header checkbox）
+                const rowCheckboxes = Array.from(
+                    document.querySelectorAll("input[type='checkbox']")
+                ).filter(cb => {
+                    const el = cb;
+                    // 排除 header/全选 checkbox
+                    if (el.closest("thead, th, [class*='header' i], [class*='Header']")) return false;
+                    // 排除 aria-label 为全选的
+                    if (el.getAttribute("aria-label") === "Select all") return false;
+                    return true;
+                });
+
+                if (rowCheckboxes.length > 0) {
+                    const checkedIds = [];
+                    rowCheckboxes.forEach((cb, idx) => {
+                        if (cb.checked && idx < listIds.length) {
+                            checkedIds.push(String(listIds[idx]));
+                        }
+                    });
+                    if (checkedIds.length > 0) return checkedIds;
+                    // 没有勾选则返回空（触发"导出全部"逻辑）
+                    return [];
+                }
+            }
+
+            // 3. DOM 兜底：扫描勾选的 checkbox，向上找 Vue 实例或 data 属性
+            const checkedIds = [];
+            document.querySelectorAll("input[type='checkbox']:checked").forEach(cb => {
+                if (cb.closest("thead, th, [class*='header' i]")) return;
+                let el = cb.parentElement;
+                for (let i = 0; i < 15 && el; i++) {
+                    const vue = el.__vue__;
+                    if (vue) {
+                        const fileId = vue.$props?.file?.id || vue.$props?.id
+                            || vue.$data?.file?.id || vue.$data?.id;
+                        if (fileId) { checkedIds.push(String(fileId)); break; }
+                    }
+                    const id = el.dataset?.id || el.dataset?.fileId || el.getAttribute("data-id");
+                    if (id) { checkedIds.push(String(id)); break; }
+                    el = el.parentElement;
+                }
+            });
+            return checkedIds;
+        },
+
+        getShareFileById(id) {
+            const store = this._getShareStore();
+            const share = store?.state?.share;
+            if (!share) return null;
+            // share.files 是 id→fileObject 的 map（诊断已确认）
+            const filesMap = share.files || share.fileMap;
+            if (filesMap && typeof filesMap === "object" && !Array.isArray(filesMap)) {
+                return filesMap[id] || null;
+            }
+            // 兜底：fileList 等数组形式
+            const arr = share.fileList;
+            if (Array.isArray(arr)) return arr.find(f => String(f.id) === String(id)) || null;
+            return null;
+        },
+
+        async _fetchShareRootFiles(shareId, passCodeToken) {
+            // 调 share/detail 枚举根目录（不递归），用于勾选时 store 拿不到文件对象的兜底
+            const url = `${XUNLEI_API_BASE}/drive/v1/share/detail?share_id=${encodeURIComponent(shareId)}&parent_id=&pass_code_token=${encodeURIComponent(passCodeToken)}&limit=100&thumbnail_size=SIZE_SMALL`;
+            const respText = await helper.get(url, this.getAuthHeaders());
+            const resp = JSON.parse(respText);
+            return resp.files || [];
+        },
+
+        async getShareFilesInFolder(shareId, parentId, passCodeToken, pathPrefix, onProgress) {
+            const results = [];
+            let pageToken = "";
+            do {
+                const url = `${XUNLEI_API_BASE}/drive/v1/share/detail?share_id=${encodeURIComponent(shareId)}&parent_id=${encodeURIComponent(parentId)}&pass_code_token=${encodeURIComponent(passCodeToken)}&limit=100&page_token=${encodeURIComponent(pageToken)}&thumbnail_size=SIZE_SMALL`;
+                const respText = await helper.get(url, this.getAuthHeaders());
+                const resp = JSON.parse(respText);
+                const files = resp.files || [];
+                for (const f of files) {
+                    if (f.kind === "drive#folder") {
+                        const subPath = pathPrefix ? `${pathPrefix}/${f.name}` : f.name;
+                        const subFiles = await this.getShareFilesInFolder(shareId, f.id, passCodeToken, subPath, onProgress);
+                        results.push(...subFiles);
+                    } else {
+                        const gcid = f.hash || "";
+                        if (!gcid) continue;
+                        const filePath = pathPrefix ? `${pathPrefix}/${f.name}` : f.name;
+                        results.push({ path: filePath, gcid, size: Number(f.size) || 0 });
+                    }
+                }
+                pageToken = resp.next_page_token || "";
+                if (onProgress) onProgress(results.length);
+            } while (pageToken);
+            return results;
+        },
+
+        injectShareButton() {
+            if (document.getElementById(BTN_XUNLEI_SHARE_JSON_ID)) return;
+            const btn = document.createElement("button");
+            btn.id = BTN_XUNLEI_SHARE_JSON_ID;
+            btn.type = "button";
+            btn.style.cssText =
+                "box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;" +
+                "height:36px;padding:0 12px;margin-right:8px;" +
+                "border-radius:4px;white-space:nowrap;cursor:pointer;vertical-align:middle;" +
+                "background:#ff9800 !important;border:1px solid #ff9800 !important;color:#fff !important;" +
+                "font-size:13px;line-height:1.45;font-weight:500;" +
+                "font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,\"Helvetica Neue\",Arial," +
+                "\"PingFang SC\",\"Hiragino Sans GB\",\"Microsoft YaHei\",sans-serif;";
+            const span = document.createElement("span");
+            span.textContent = "生成秒传JSON";
+            span.style.cssText = "font-size:13px;line-height:1.45;font-weight:500;";
+            btn.appendChild(span);
+            const setLabel = (t) => { span.textContent = t; };
+            btn.onclick = async () => {
+                try {
+                    btn.disabled = true;
+                    setLabel("生成中...");
+                    await generateXunleiShare();
+                    setLabel("生成秒传JSON");
+                } catch (e) {
+                    alert(e?.message || "生成失败");
+                    setLabel("生成秒传JSON");
+                } finally {
+                    btn.disabled = false;
+                }
+            };
+            const tryInsert = () => {
+                if (document.getElementById(BTN_XUNLEI_SHARE_JSON_ID)) return true;
+                const box = document.querySelector("[class*='Share__batchActionBox']");
+                if (!box) return false;
+                const copyBtn = Array.from(box.querySelectorAll("button"))
+                    .find(b => b.textContent.includes("复制分享链接"));
+                if (!copyBtn) return false;
+                box.insertBefore(btn, copyBtn);
+                return true;
+            };
+            if (tryInsert()) return;
+            const observer = new MutationObserver(() => {
+                if (tryInsert()) observer.disconnect();
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
+            setTimeout(() => { observer.disconnect(); }, 10000);
         },
     };
 
@@ -3871,10 +4048,18 @@ function guangyaExtractMd5FromEtag(raw) {
             const box = document.createElement("div");
             box.style.cssText =
                 "background:#fff;padding:18px 20px;border-radius:10px;max-width:94vw;width:520px;max-height:88vh;overflow:auto;box-shadow:0 8px 32px rgba(0,0,0,.2)";
-            const title = document.createElement("div");
+            const titleContainer = document.createElement('div');
+            const title = document.createElement("span");
             title.textContent = "导入秒传 JSON 到当前账号";
             title.style.cssText =
-                "font-weight:600;font-size:15px;margin-bottom:10px;color:#111;";
+                "font-size:15px;font-weight:600;margin-bottom:10px;color:#111;";
+            const version = document.createElement("span");
+            version.textContent = "版本号：" + SCRIPT_VERSION
+            version.style.cssText =
+                "font-size:12px;margin-bottom:10px;color:#555;";
+            titleContainer.appendChild(title);
+            titleContainer.appendChild(version);
+            titleContainer.style.cssText = "display: flex; justify-content: space-between;"
             const hint = document.createElement("p");
             hint.style.cssText =
                 "margin:0 0 8px;font-size:12px;line-height:1.5;color:#555;";
@@ -3947,7 +4132,7 @@ function guangyaExtractMd5FromEtag(raw) {
             fileRow.appendChild(btnClearFile);
             fileRow.appendChild(fileLoadedHint);
             const ta = document.createElement("textarea");
-            ta.placeholder = '{"files":[{"path":"a.mp4","etag":"…32位md5…","gcid":"迅雷GCID","size":123}]}';
+            ta.placeholder = '{"files":[{"path":"a.mp4","etag":"32位md5","gcid":"迅雷GCID","size":123}]}';
             ta.style.cssText =
                 "width:100%;box-sizing:border-box;min-height:180px;padding:10px;border:1px solid #ccc;border-radius:6px;font-size:12px;font-family:ui-monospace,monospace;margin-top:4px;";
             const status = document.createElement("div");
@@ -4193,7 +4378,7 @@ function guangyaExtractMd5FromEtag(raw) {
             };
             row.appendChild(btnClose);
             row.appendChild(btnRun);
-            box.appendChild(title);
+            box.appendChild(titleContainer);
             box.appendChild(hint);
             box.appendChild(fileRow);
             box.appendChild(ta);
@@ -4542,6 +4727,66 @@ function guangyaExtractMd5FromEtag(raw) {
             };
         },
     };
+
+    async function generateXunleiShare() {
+        if (!panXunlei._cachedToken) {
+            throw new Error(
+                "未检测到迅雷云盘登录态（Bearer token）。\n" +
+                "请在已登录状态下刷新页面，等待文件列表加载完成后再点击『生成秒传JSON』。"
+            );
+        }
+        const shareId = panXunlei.getShareId();
+        if (!shareId) throw new Error("无法解析分享 ID。");
+        const passCodeToken = panXunlei.getPassCodeToken();
+        if (!passCodeToken) throw new Error("未获取到 pass_code_token，请等待页面加载完成后重试。");
+
+        const selectedIds = panXunlei.getShareSelectedIds();
+        if (!selectedIds.length) {
+            throw new Error("请先勾选要导出的文件或文件夹，再点击『生成秒传JSON』。");
+        }
+
+        helper.showLoadingDialog("正在生成迅雷分享秒传 JSON", "正在获取文件信息...");
+        try {
+            const results = [];
+
+            // 先从 store 拿文件对象；拿不到则调 API 枚举根目录匹配
+            let rootFiles = null;
+            for (const id of selectedIds) {
+                let f = panXunlei.getShareFileById(id);
+                if (!f) {
+                    // 懒加载根目录文件列表
+                    if (!rootFiles) {
+                        rootFiles = await panXunlei._fetchShareRootFiles(shareId, passCodeToken);
+                    }
+                    f = rootFiles.find(x => String(x.id) === String(id)) || null;
+                }
+                if (!f) continue;
+                if (f.kind === "drive#folder") {
+                    helper.updateLoadingMsg(`正在递归获取文件夹：${f.name}...`);
+                    const subFiles = await panXunlei.getShareFilesInFolder(
+                        shareId, f.id, passCodeToken, f.name,
+                        (count) => helper.updateLoadingMsg(`正在递归获取文件夹：${f.name}（已找到 ${count} 个文件）`)
+                    );
+                    results.push(...subFiles);
+                } else {
+                    const gcid = f.hash || "";
+                    if (!gcid) continue;
+                    results.push({ path: f.name, gcid, size: Number(f.size) || 0 });
+                }
+            }
+
+            if (!results.length) throw new Error("没有可导出的文件（文件没有 gcid 或列表为空）。");
+            const store = panXunlei._getShareStore();
+            const shareTitle = store?.state?.share?.shareInfo?.params?.title
+                || store?.state?.share?.shareInfo?.title || "";
+            const jsonData = helper.makeJson(results);
+            helper.closeLoadingDialog();
+            helper.showResultDialog(jsonData, shareTitle);
+        } catch (e) {
+            helper.closeLoadingDialog();
+            throw e;
+        }
+    }
 
     async function generateXunlei() {
         if (!panXunlei._cachedToken) {
@@ -4996,12 +5241,12 @@ function guangyaExtractMd5FromEtag(raw) {
         const span = document.createElement("span");
         span.textContent = "导入秒传JSON";
         btn.appendChild(span);
-        span.style.setProperty("font-size", "18px", "important");
+        span.style.setProperty("font-size", "16px", "important");
         span.style.setProperty("line-height", "1.45", "important");
         span.style.setProperty("font-weight", "500", "important");
         let css =
             "box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;" +
-            "height:40px;min-height:40px;padding:0 22px;" +
+            "height:36px;min-height:36px;padding:0 14px;" +
             "border-radius:8px;white-space:nowrap;cursor:pointer;vertical-align:middle;" +
             "background:#ff9800 !important;border:1px solid #ff9800 !important;color:#fff !important;" +
             "font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,\"Helvetica Neue\",Arial," +
@@ -5113,18 +5358,16 @@ function guangyaExtractMd5FromEtag(raw) {
         const host = location.hostname;
 
         if (panXunlei.isHost()) {
-            panXunlei.injectButton();
+            if (panXunlei.isSharePage()) {
+                panXunlei.injectShareButton();
+            } else {
+                panXunlei.injectButton();
+            }
             return;
         }
 
         if (panGuangya.isHost()) {
-            if (tryMountGuangyaBesideUpload()) return;
-            if (!document.getElementById(BTN_GUANGYA_IMPORT_ID)) {
-                const body =
-                    document.querySelector(BODY_SELECTOR) ||
-                    document.documentElement;
-                body.appendChild(makeGuangyaPanImportButtonElement(true));
-            }
+            tryMountGuangyaBesideUpload();
             return;
         }
 
