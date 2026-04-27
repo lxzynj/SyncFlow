@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         云盘秒传工具2.0（百度/夸克/天翼/123/迅雷/光鸭）
-// @version      2026.04.25
+// @version      2026.04.27
 // @description  云盘秒传工具2.0（百度/夸克/天翼/123/迅雷/光鸭）
 // @run-at       document-idle
 // @match        https://pan.quark.cn/*
@@ -38,7 +38,7 @@
 (function () {
     "use strict";
 
-    const SCRIPT_VERSION = "2026.04.25";
+    const SCRIPT_VERSION = "2026.04.27";
     const GUANGYA_API_BASE = "https://api.guangyapan.com";
     const GUANGYA_CODE_RES_TOKEN_INSTANT = 156;
     const GUANGYA_CODE_DIR_EXISTS = 159;
@@ -2866,7 +2866,7 @@
         getSelectedFsIds() {
             const ids = new Set();
 
-            // 🔧 v4：修复！方法0 必须只匹配【已选中】的行，否则会返回所有文件
+            // 方法0：从选中行的 data-id 属性直接提取
             try {
                 const selectedRows = document.querySelectorAll(
                     '.mouse-choose-item.selected[data-id], ' +
@@ -2881,19 +2881,13 @@
                     const id = el.getAttribute('data-id') ||
                               el.getAttribute('data-fs-id') ||
                               el.getAttribute('data-fsid');
-                    if (id && /^\d+$/.test(id)) {
-                        ids.add(id);
-                    }
+                    if (id && /^\d+$/.test(id)) ids.add(id);
                 }
-                if (ids.size) {
-                    console.log('[秒传工具] getSelectedFsIds (方式0-选中行data属性):', [...ids]);
-                    return [...ids];
-                }
+                if (ids.size) return [...ids];
             } catch { /* ignore */ }
 
-            // 🔧 修复2：改进选中检测 - 检查DOM中的checkbox选中状态
+            // 方法0b：选中行 data 属性 + fiber props 兜底
             try {
-                // 🔧 v2：添加百度网盘特有类名 mouse-choose-item 和 wp-s-pan-table__body-row
                 const checkedRows = document.querySelectorAll(
                     '.mouse-choose-item.selected, ' +
                     '.wp-s-pan-table__body-row.selected, ' +
@@ -2905,18 +2899,12 @@
                     '[class*="file"][class*="selected"], ' +
                     '.ant-table-row-selected'
                 );
-                
                 for (const row of checkedRows) {
-                    // 尝试从多种属性获取fs_id
                     const attrs = ['data-id', 'data-fs-id', 'data-fsid', 'data-key', 'data-row-key'];
                     for (const attr of attrs) {
                         const id = row.getAttribute(attr);
-                        if (id && /^\d+$/.test(id)) {
-                            ids.add(id);
-                        }
+                        if (id && /^\d+$/.test(id)) ids.add(id);
                     }
-                    
-                    // 从React fiber获取
                     const fk = Object.keys(row).find((k) =>
                         k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$"),
                     );
@@ -2937,7 +2925,6 @@
                         }
                     }
                 }
-                
                 if (ids.size) return [...ids];
             } catch { /* ignore */ }
 
@@ -2993,6 +2980,7 @@
                 if (fk) scanFiber(root[fk], 20000);
                 if (ids.size) break;
             }
+            console.log('[秒传工具] getSelectedFsIds (方法1 fiber):', [...ids]);
             if (ids.size) return [...ids];
 
             // 方法2：从选中 DOM 元素的 fiber props 提取 fs_id
@@ -3017,9 +3005,10 @@
                 }
                 return null;
             };
-            document.querySelectorAll(
+            const method2Els = document.querySelectorAll(
                 "[class*='selected']:not(head):not(style):not(script), [aria-selected='true']",
-            ).forEach((el) => {
+            );
+            method2Els.forEach((el) => {
                 if (el.tagName === "INPUT" || el.tagName === "BUTTON" || el.closest("thead")) return;
                 const id = extractFsIdFromEl(el);
                 if (id) ids.add(id);
@@ -3326,14 +3315,13 @@
 
                     if (data.errno === 0 && Array.isArray(data.info)) {
                         for (const item of data.info) {
-                        // 🔧 修复3：处理文件名中的&符号
                         const filename = String(item.filename || item.server_filename || "").replace(/&/g, ' ');
                         result[String(item.fs_id)] = {
                             md5: this.decodeBaiduMd5(item.md5),
                                 path: String(item.path || "").replace(/&/g, ' '),
                                 size: Number(item.size || 0),
                                 filename: filename,
-                                isdir: item.isdir === 1,
+                                isdir: item.isdir == 1,
                             };
                         }
                     }
@@ -3346,16 +3334,12 @@
         },
 
         async collectFiles() {
-            // 百度个人主页逻辑
             const output = [];
             const folderItems = [];
 
             // 方式一：fs_id（React fiber / Redux）
             const fsIds = this.getSelectedFsIds();
-            console.log('[秒传工具] getSelectedFsIds 结果:', fsIds);
-            
             if (fsIds.length) {
-                console.log('[秒传工具] 使用方式一：fs_id 匹配');
                 helper.updateLoadingMsg("正在获取文件信息...");
                 const metas = await this.getFileMetas(fsIds);
                 for (const id of fsIds) {
@@ -3371,9 +3355,7 @@
 
             // 方式二：DOM 文件名 + list API 匹配（兜底）
             if (!output.length && !folderItems.length) {
-                console.log('[秒传工具] 使用方式二：DOM文件名匹配');
                 const selectedNames = this.getSelectedFileNames();
-                console.log('[秒传工具] getSelectedFileNames 结果:', selectedNames);
                 if (!selectedNames.length) throw new Error("请先在百度网盘勾选要导出的文件或文件夹");
 
                 const currentDir = this.getCurrentDir();
@@ -3391,14 +3373,6 @@
                     `dir=${encodeURIComponent(cleanDir)}&order=name&desc=0&showempty=0` +
                     `&web=1&page=1&num=1000&channel=chunlei&app_id=250528` +
                     `&bdstoken=${encodeURIComponent(bdstoken)}`;
-
-                console.log('[秒传工具] 百度网盘 API 请求信息:', {
-                    url: url.replace(bdstoken, '***'),  // 隐藏 token
-                    currentDir: cleanDir,
-                    originalCurrentDir: currentDir,
-                    bdstokenLength: bdstoken.length,
-                    bdstokenPrefix: bdstoken.substring(0, 8) + '...'
-                });
 
                 const text = await helper.get(url, { Referer: "https://pan.baidu.com/disk/main" });
                 const data = JSON.parse(text);
